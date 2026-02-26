@@ -77,62 +77,27 @@ function getAbortSignal() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// HELPERS (used inside thunks)
+// FIELD RESOLVERS
 // ─────────────────────────────────────────────────────────────
 
+/** Map of _module → fields used for scoring/display. */
+const MODULE_FIELD_MAP = {
+  users:    (i) => [i.full_name, i.email],
+  chats:    (i) => [i.dname, i.recipantssummary, i.recipientssumm, i.name, i.title],
+  channels: (i) => [i.title],
+  messages: (i) => [i.message, i.msg, i.ctitle],
+};
+
+const DEFAULT_FIELDS = (i) => [i.name, i.title, i.description, i.full_name];
 
 function getDefaultResolveFields(item) {
-  switch (item._module) {
-    case 'users':
-      return [
-        item.full_name,
-        item.email,
-      ].filter(Boolean);
-    
-    case 'chats':
-      return [
-        item.dname,
-        item.recipantssummary,
-        item.recipientssumm,
-        item.name,
-        item.title,
-      ].filter(Boolean);
-    
-    case 'channels':
-      return [
-        item.title,
-        // item.cn,
-        // item.dn,
-        // item.channelName,
-        // item.name,
-        // item.description,
-      ].filter(Boolean);
-    
-    case 'messages':
-      return [
-        item.message,
-        item.msg,
-        item.ctitle,
-      ].filter(Boolean);
-    
-    case 'department':
-    case 'bots':
-    case 'threads':
-    case 'widgets':
-    case 'apps':
-    case 'connections':
-    case 'settings':
-    case 'files':
-    default:
-      return [
-        item.name,
-        item.title,
-        item.description,
-        item.full_name,
-      ].filter(Boolean);
-  }
+  const resolver = MODULE_FIELD_MAP[item._module] ?? DEFAULT_FIELDS;
+  return resolver(item).filter(Boolean);
 }
 
+// ─────────────────────────────────────────────────────────────
+// DEDUP KEY
+// ─────────────────────────────────────────────────────────────
 
 function getDefaultDedupKey(item) {
   if (item._module === 'users') {
@@ -142,38 +107,221 @@ function getDefaultDedupKey(item) {
   return `${item._module ?? 'unknown'}::${item.id ?? item.name ?? Math.random()}`;
 }
 
+// ─────────────────────────────────────────────────────────────
+// CHAT PARTICIPANT HELPERS
+// ─────────────────────────────────────────────────────────────
+
 /**
- * Helper to extract the "other" user's ZUID from a 1-1 chat.
- * @param {string|object[]} summary - recipantssummary (string or array)
- * @param {string} loggedInZuid - ID of current user (to exclude)
- * @param {string} [chatTitle] - Optional chat title for heuristic matching
+ * Extract the "other" user's ZUID from a 1-1 chat.
+ * @param {string|object[]} summary  - recipantssummary (string or array)
+ * @param {string}          loggedInZuid - current user's ID (to exclude)
+ * @param {string}          [chatTitle]  - optional title for heuristic matching
+ * @returns {string|null}
  */
 function getOtherUserId(summary, loggedInZuid, chatTitle) {
   try {
     const participants = typeof summary === 'string' ? JSON.parse(summary) : summary || [];
     if (!Array.isArray(participants)) return null;
 
-    let otherUser = null;
+    const otherUser =
+      (loggedInZuid && participants.find(p => String(p.zuid) !== String(loggedInZuid))) ||
+      (chatTitle    && participants.find(p => p.dname === chatTitle)) ||
+      (participants.length === 1 ? participants[0] : null);
 
-    // Strategy A: Exclude logged-in user
-    if (loggedInZuid) {
-      otherUser = participants.find(p => String(p.zuid) !== String(loggedInZuid));
-    }
-
-    // Strategy B: Heuristic (Chat Title == User Name)
-    if (!otherUser && chatTitle) {
-      otherUser = participants.find(p => p.dname === chatTitle);
-    }
-
-    // Strategy C: Fallback to first participant if only 1 exists (edge case)
-    if (!otherUser && participants.length === 1) {
-      otherUser = participants[0];
-    }
-    
     return otherUser?.zuid || null;
-  } catch (e) {
+  } catch {
     return null;
   }
+}
+
+/** Derive _module from chat_type. */
+function chatTypeToModule(chatType) {
+  switch (String(chatType)) {
+    case '8':  return 'channels';
+    case '1':  return 'users';
+    case '11': return 'threads';
+    case '9':  return 'bot';
+    default:   return '';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// THUNK HELPERS  (pure functions extracted from executeSearch)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Build Sets of IDs already present in clientData so we can exclude
+ * duplicates when server results arrive.
+ */
+function buildExclusionSets(chats, users, loggedUserZuid) {
+  const existingChatIds = new Set();
+  const existingUserIds = new Set();
+
+  chats.forEach(chat => {
+    if (chat.chatid) existingChatIds.add(String(chat.chatid));
+
+    if (String(chat.chat_type) === '1') {
+      const otherZuid = getOtherUserId(chat.recipantssummary, loggedUserZuid, chat.title);
+      if (otherZuid) existingUserIds.add(String(otherZuid));
+    }
+  });
+
+  users.forEach(u => {
+    if (u.zuid) existingUserIds.add(String(u.zuid));
+  });
+
+  return { existingChatIds, existingUserIds };
+}
+
+/**
+ * Client-side search: fast, synchronous filtering of local data.
+ * Returns { clientChats, clientUsers, clientResults }.
+ */
+function runClientSearch(chats, users, queryLower, loggedUserZuid) {
+  // Chats: match title prefix, derive _module from chat_type
+  const clientChats = chats.slice(0, MAX_CLIENT_CHATS)
+    .map(c => ({
+      ...c,
+      title:   c.title.replace(/^[@#]/, ''),
+      _module: chatTypeToModule(c.chat_type),
+      _source: 'client',
+      id:      String(c.chat_type) === '1'
+        ? getOtherUserId(c.recipantssummary, loggedUserZuid, c.title) || c.chatid
+        : c.chatid,
+    }))
+    .filter(c => c.title?.toLowerCase().startsWith(queryLower))
+    .sort((a, b) => (b.score || 0) - (a.score || 0));
+
+  // ZUIDs already covered by 1-1 chats (to avoid user duplicates)
+  const clientChatZuids = new Set(
+    clientChats.filter(c => c._module === 'users').map(c => String(c.id)),
+  );
+
+  // Users: match name/email prefix, skip those already in chat list
+  const clientUsers = users.slice(0, MAX_CLIENT_USERS)
+    .map(u => ({ ...u, _module: 'users', _source: 'client', id: u.Zuid || u.zuid || u.id }))
+    .filter(u => {
+      const nameMatch  = (u.full_name || u.display_name || '').toLowerCase().startsWith(queryLower);
+      const emailMatch = (u.email || '').toLowerCase().startsWith(queryLower);
+      return (nameMatch || emailMatch) && !clientChatZuids.has(String(u.id));
+    });
+
+  return { clientChats, clientUsers, clientResults: [...clientChats, ...clientUsers] };
+}
+
+/**
+ * Construct the array of server API promises.
+ * Also captures globalsearch and users-API results into the provided
+ * `captured` object so they can be appended to clientData later.
+ *
+ * @returns {Promise[]} serverPromises
+ */
+function buildServerPromises({
+  parsedQuery, signal, loggedUserZuid,
+  enabledModules, activeCategory,
+  existingChatIds, existingUserIds,
+  captured,  // { globalSearchResults: [], usersApiResults: [] }
+}) {
+  const promises = [];
+
+  // ── Global search API ──
+  promises.push(
+    moduleApis.globalsearch(parsedQuery, { signal })
+      .then(raw => {
+        captured.globalSearchResults = (Array.isArray(raw) ? raw : []).map(item => ({
+          ...item,
+          _module: item._module || '',
+          _source: item._source || 'server',
+          id: String(item.chat_type) === '1'
+            ? getOtherUserId(item.recipantssummary, loggedUserZuid, item.title) || item.chatid
+            : item.chatid,
+        }));
+        return captured.globalSearchResults;
+      })
+      .catch(e => {
+        if (e?.name !== 'AbortError') console.warn('[Search] Global search failed:', e?.message);
+        return [];
+      }),
+  );
+
+  // ── Users API (captured separately for clientData enrichment) ──
+  if (moduleApis.users && enabledModules.includes('users') && (activeCategory === 'all' || activeCategory === 'users')) {
+    promises.push(
+      moduleApis.users(parsedQuery, { signal })
+        .then(raw => {
+          const list = Array.isArray(raw) ? raw : [];
+          captured.usersApiResults = list
+            .map(item => ({ ...item, _module: item._module || 'users', _source: item._source || 'server', id: item.zuid }))
+            .filter(item => !existingUserIds.has(String(item.id)));
+          return captured.usersApiResults;
+        })
+        .catch(e => {
+          if (e?.name !== 'AbortError') console.warn('[Search] Module "users" failed:', e?.message);
+          return [];
+        }),
+    );
+  }
+
+  // ── Generic module helper ──
+  const addModule = (mod, apiFn, filterSet, idField) => {
+    if (!apiFn) return;
+    if (!enabledModules.includes(mod)) return;
+    if (activeCategory !== 'all' && activeCategory !== mod) return;
+
+    promises.push(
+      apiFn(parsedQuery, { signal })
+        .then(raw => {
+          const list = Array.isArray(raw) ? raw : [];
+          return list
+            .map(item => ({ ...item, _module: item._module || mod, _source: item._source || 'server', id: item[idField] }))
+            .filter(item => !filterSet || !filterSet.has(String(item.id)));
+        })
+        .catch(e => {
+          if (e?.name !== 'AbortError') console.warn(`[Search] Module "${mod}" failed:`, e?.message);
+          return [];
+        }),
+    );
+  };
+
+  addModule('chats',       moduleApis.chats,       existingChatIds, 'chatid');
+  addModule('channels',    moduleApis.channels,    existingChatIds, 'chatid');
+  addModule('bots',        moduleApis.bots,        existingChatIds, 'chatid');
+  addModule('threads',     moduleApis.threads,     existingChatIds, 'chatid');
+  addModule('messages',    moduleApis.messages,    null,            'msguid');
+  addModule('files',       moduleApis.files,       null,            'id');
+  addModule('department',  moduleApis.department,  null,            'id');
+  addModule('widgets',     moduleApis.widgets,     null,            'id');
+  addModule('apps',        moduleApis.apps,        null,            'id');
+  addModule('connections', moduleApis.connections, null,            'id');
+  addModule('settings',    moduleApis.settings,    null,            'id');
+
+  return promises;
+}
+
+/**
+ * Append unique global-search results into `chats` and users-API
+ * results into `users` (mutates the arrays in-place).
+ */
+function enrichClientData({ chats, users, existingChatIds, existingUserIds, captured }) {
+  captured.globalSearchResults.forEach(item => {
+    if (item.chatid) {
+      const cid = String(item.chatid);
+      if (!existingChatIds.has(cid)) {
+        existingChatIds.add(cid);
+        chats.push(item);
+      }
+    }
+  });
+
+  captured.usersApiResults.forEach(item => {
+    if (item.zuid) {
+      const uid = String(item.zuid);
+      if (!existingUserIds.has(uid)) {
+        existingUserIds.add(uid);
+        users.push(item);
+      }
+    }
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -199,205 +347,70 @@ export const executeSearch = createAsyncThunk(
   'search/execute',
   async (payload, { rejectWithValue, dispatch }) => {
     const {
-      parsedQuery,
-      context,
-      activeCategory,
+      parsedQuery, context, activeCategory,
       clientData,
       enabledModules = [],
-      moduleWeights,
-      scorerConfig,
-      getFields,
-      getDedupKey,
-      minServerLen,
-      maxResults,
+      moduleWeights, scorerConfig,
+      getFields, getDedupKey,
+      minServerLen, maxResults,
       loggedUser,
     } = payload;
 
-    // ── Abort controller for server calls ──
-    const signal = getAbortSignal();
-
-    // ── Field/weight accessors ──
-    const resolveFields = getFields ?? getDefaultResolveFields;
+    const signal        = getAbortSignal();
+    const resolveFields = getFields   ?? getDefaultResolveFields;
     const resolveDedupKey = getDedupKey ?? getDefaultDedupKey;
-    const getWeight = (item) => moduleWeights[item._module] ?? DEFAULT_MODULE_WEIGHTS[item._module];
+    const getWeight     = (item) => moduleWeights[item._module] ?? DEFAULT_MODULE_WEIGHTS[item._module];
 
-    // ── Build exclusion Sets from client data ──
-    const existingChatIds = new Set();
-    const existingUserIds = new Set();
     const { chats = [], users = [] } = clientData;
+    const loggedUserZuid = loggedUser?.Zuid;
 
-    chats.forEach(chat => {
-      // 1. All chats get their ID tracked (for channels, bots, etc.)
-      if (chat.chatid) existingChatIds.add(String(chat.chatid));
-
-      // 2. If 1-1 chat (type 1), we also track the other user's ZUID
-      if (String(chat.chat_type) === '1') {
-        const otherZuid = getOtherUserId(
-          chat.recipantssummary, 
-          loggedUser?.Zuid, 
-          chat.title
-        );
-        if (otherZuid) {
-          existingUserIds.add(String(otherZuid));
-        }
-      }
-    });
-    
-    // Also track client users
-    users.forEach(u => {
-      if(u.zuid) existingUserIds.add(String(u.zuid));
-    });  
-   
+    // ── 1. Build exclusion sets from existing client data ──
+    const { existingChatIds, existingUserIds } = buildExclusionSets(chats, users, loggedUserZuid);
 
     try {
-      // ── 1. Client search (synchronous, instant) ──
+      // ── 2. Client search (synchronous, instant) ──
       const queryLower = parsedQuery.trimmed.toLowerCase();
-
-      // Chats logic: startsWith(title) & sort by score
-      const clientChats = chats.slice(0, MAX_CLIENT_CHATS)
-        .map(c => ({ 
-          ...c, 
-          title: c.title.replace(/^[@#]/, ''), 
-          _module: c.chat_type == 8 ? 'channels' : c.chat_type == 1 ? 'users' : c.chat_type == 11 ? 'threads' : c.chat_type == 9 ? 'bot' : '',  
-          _source: 'client',
-          id: c.chat_type == 1 
-            ? getOtherUserId(c.recipantssummary, loggedUser?.Zuid, c.title) || c.chatid 
-            : c.chatid, // For 1-1 chats, use ZUID to help deduplication with users
-        }))
-        .filter(c => c.title?.toLowerCase().startsWith(queryLower))
-        .sort((a, b) => (b.score || 0) - (a.score || 0));
-
-      // Users logic: startsWith(name/email)
-      const clientChatZuids = new Set(
-        clientChats
-          .filter(c => c._module === 'users')
-          .map(c => String(c.id))
-      );
-
-      const clientUsers = users.slice(0, MAX_CLIENT_USERS)
-        .map(u => ({ 
-          ...u, 
-          _module: 'users',
-          _source: 'client',
-          id: u.Zuid || u.zuid || u.id,
-        }))
-        .filter(u => {
-          const nameMatch = (u.full_name || u.display_name || '').toLowerCase().startsWith(queryLower);
-          const emailMatch = (u.email || '').toLowerCase().startsWith(queryLower);
-          
-          // Exclude users already present in clientChats (to avoid duplicates in the combined list)
-          const isExcluded = clientChatZuids.has(String(u.id));
-          
-          return (nameMatch || emailMatch) && !isExcluded;
-        });
-
-      const clientResults = [...clientChats, ...clientUsers];
+      const { clientChats, clientUsers, clientResults } = runClientSearch(chats, users, queryLower, loggedUserZuid);
 
       console.log('Client Results:', clientResults);
 
       // Dispatch partial results immediately
-      dispatch(searchSlice.actions.updateResults({
-        results: clientResults,
-        isPartial: true,  
-      }));
+      dispatch(searchSlice.actions.updateResults({ results: clientResults, isPartial: true }));
 
-      // ── 2. Server search (Condition: < 15 results in either category) ──
-      const serverPromises = [];
+      // ── 3. Server search (when client results are sparse) ──
       const shouldFetchServer = clientChats.length < 15 || clientUsers.length < 15;
+      const captured = { globalSearchResults: [], usersApiResults: [] };
 
-      if (shouldFetchServer) {
-        // Global search API
-        serverPromises.push(
-          moduleApis.globalsearch(parsedQuery, { signal })
-            .then(rawGlobal => 
-              (Array.isArray(rawGlobal) ? rawGlobal : []).map(item => ({
-                ...item,
-                _module: item._module || '',
-                _source: item._source || 'server',
-                id: item.chat_type == 1 ? getOtherUserId(item.recipantssummary, loggedUser?.Zuid, item.title) || item.chatid : item.chatid, // Heuristic for global search chat items
-              }))
-            )
-            .catch(e => {
-              if (e?.name !== 'AbortError') {
-                console.warn(`[Search] Global search failed:`, e?.message);
-              }
-              return [];
-            })
-        );
-      
+      const serverPromises = shouldFetchServer
+        ? buildServerPromises({
+            parsedQuery, signal, loggedUserZuid,
+            enabledModules, activeCategory,
+            existingChatIds, existingUserIds,
+            captured,
+          })
+        : [];
 
-     
-      const addModulePromise = (mod, apiFn, filterSet, idField) => {
-        if (!apiFn) return;
-       
-        if (!enabledModules.includes(mod)) return;
-        
-       
-        if (activeCategory !== 'all' && activeCategory !== mod) return;
-
-        serverPromises.push(
-          apiFn(parsedQuery, { signal })
-            .then(raw => {
-              const list = Array.isArray(raw) ? raw : [];
-              return list
-                .map(item => ({
-                  ...item,
-                  _module: item._module || mod,
-                  _source: item._source || 'server',
-                  id: item[idField],
-                }))
-                // Apply module-specific filtering here
-                .filter(item => !filterSet || !filterSet.has(String(item.id)));
-            })
-            .catch(e => {
-              if (e?.name !== 'AbortError') {
-                console.warn(`[Search] Module "${mod}" failed:`, e?.message);
-              }
-              return [];
-            })
-        );
-      };
-
-      
-      addModulePromise('users',       moduleApis.users,       existingUserIds, 'zuid');
-      addModulePromise('chats',       moduleApis.chats,       existingChatIds, 'chatid');
-      addModulePromise('channels',    moduleApis.channels,    existingChatIds, 'chatid');
-      addModulePromise('bots',        moduleApis.bots,        existingChatIds, 'chatid');
-      addModulePromise('threads',     moduleApis.threads,     existingChatIds, 'chatid');
-      addModulePromise('messages',    moduleApis.messages,    null,            'msguid');
-      addModulePromise('files',       moduleApis.files,       null,            'id');
-      addModulePromise('department',  moduleApis.department,  null,            'id');
-      addModulePromise('widgets',     moduleApis.widgets,     null,            'id');
-      addModulePromise('apps',        moduleApis.apps,        null,            'id');
-      addModulePromise('connections', moduleApis.connections, null,            'id');
-      addModulePromise('settings',    moduleApis.settings,    null,            'id');
-      }
-
-      // ── 3. Wait for all server results ──
+      // ── 4. Await all server responses ──
       const serverResponses = await Promise.all(serverPromises);
       const rawServer = serverResponses.flat();
-      
+
+      // ── 5. Enrich clientData with unique server results ──
+      enrichClientData({ chats, users, existingChatIds, existingUserIds, captured });
+
+      // ── 6. Rank, deduplicate, merge ──
       const serverResults = rankResults(
-        rawServer,
-        parsedQuery.keywords,
-        parsedQuery.phrase,
-        resolveFields,
-        getWeight,
-        scorerConfig,
+        rawServer, parsedQuery.keywords, parsedQuery.phrase,
+        resolveFields, getWeight, scorerConfig,
       );
-     
-      
+
       const merged = [
         ...clientResults,
         ...deduplicateBy(serverResults, resolveDedupKey)
-           .filter(sItem => !clientResults.some(cItem => resolveDedupKey(cItem) === resolveDedupKey(sItem)))
+          .filter(sItem => !clientResults.some(cItem => resolveDedupKey(cItem) === resolveDedupKey(sItem))),
       ];
 
-      // No global re-rank, just slice?
-      // const globallyRanked = merged; 
+      const final = maxResults ? merged.slice(0, maxResults) : merged;
 
-      const final  = maxResults ? merged.slice(0, maxResults) : merged;
-      
       return { results: final, isPartial: false };
 
     } catch (e) {
@@ -430,16 +443,9 @@ const initialState = {
   highlightedIndex: -1,
   activeCategory:   'all',
   activeFilters:    {},
-
-  // Context
   context:    'home',
-
-  // History
   searchHistory: loadHistory(),
 
-  // Runtime config (set by useSearch on mount, never hardcoded here)
-  // These are NOT in the store — they live in the hook.
-  // The store is config-agnostic.
 };
 
 // ─────────────────────────────────────────────────────────────

@@ -58,7 +58,7 @@ import { DEFAULT_SCORER_CONFIG } from '../engine/scorer';
 // DEFAULTS
 // ─────────────────────────────────────────────────────────────
 
-const DEBOUNCE_MS     = 180;
+const DEBOUNCE_MS     = 600;
 const MIN_SERVER_LEN  = 3;
 
 const defaultGetFields = (item) => {
