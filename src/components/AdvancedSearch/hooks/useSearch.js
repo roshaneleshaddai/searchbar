@@ -39,7 +39,7 @@ import {
   // actions
   setQuery, setOpen, moveHighlight, setHighlightedIndex, setActiveCategory,
   setContext, addFilter, removeFilter, clearFilters,
-  addToHistory, clearHistory, clearSearch, clearExpiredCache,
+  addToHistory, clearHistory, clearSearch, clearExpiredCache, resetResults,
   // thunk
   executeSearch,
   // selectors
@@ -53,6 +53,7 @@ import {
   DEFAULT_MODULE_WEIGHTS,
 } from '../store/searchSlice';
 import { DEFAULT_SCORER_CONFIG } from '../engine/scorer';
+import { needsServerFetch } from '../engine/queryParser';
 
 // ─────────────────────────────────────────────────────────────
 // DEFAULTS
@@ -215,6 +216,7 @@ export function useSearch({
 
   // ── Debounce ref ──
   const debounceRef = useRef(null);
+  const lastExecutedKeyRef = useRef('');
 
  
   const moduleWeights = useMemo(() => ({
@@ -228,8 +230,23 @@ export function useSearch({
   // ─────────────────────────────────────────────────────────────
 
   const triggerSearch = useCallback((pq, category) => {
-    if (pq.isEmpty) return;
     const cfg = configRef.current;
+    const queryKey = JSON.stringify({
+      trimmed: pq.trimmed,
+      filters: pq.filters,
+      category,
+      context: context ?? currentContext,
+    });
+
+    if (pq.isEmpty || !needsServerFetch(pq, cfg.minServerLen)) {
+      lastExecutedKeyRef.current = '';
+      dispatch(resetResults());
+      return;
+    }
+
+    if (lastExecutedKeyRef.current === queryKey) return;
+    lastExecutedKeyRef.current = queryKey;
+
     dispatch(executeSearch({
       parsedQuery:    pq,
       context:        context ?? currentContext,
@@ -244,7 +261,7 @@ export function useSearch({
       maxResults:     cfg.maxResults,
       loggedUser:     cfg.loggedUser,
     }));
-  }, [dispatch, context, currentContext, moduleWeights]);
+  }, [dispatch, moduleWeights, context, currentContext]);
 
   const handleQueryChange = useCallback((value) => {
     dispatch(setQuery(value));
@@ -260,7 +277,11 @@ export function useSearch({
         triggerSearch(fresh.parsedQuery, fresh.activeCategory);
       });
     }, debounceMs);
-  }, [dispatch, parsedQuery, onQueryChange, debounceMs, activeCategory, triggerSearch]);
+  }, [dispatch, parsedQuery, debounceMs, onQueryChange, triggerSearch]);
+
+  useEffect(() => () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+  }, []);
 
 
   const handleCategoryChange = useCallback((category) => {

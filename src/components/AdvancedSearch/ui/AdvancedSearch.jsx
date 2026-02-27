@@ -401,7 +401,7 @@ export default function AdvancedSearch({
 }) {
   const searchConfig = {
     context, clientData, moduleApis, moduleConfig, scorerConfig,
-    onSelect, debounceMs: 180, minServerLen: 3, loggedUser, 
+    onSelect, debounceMs:600, minServerLen: 3, loggedUser,
   };
 
   return (
