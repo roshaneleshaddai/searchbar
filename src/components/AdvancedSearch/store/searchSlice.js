@@ -62,6 +62,7 @@ const MAX_CLIENT_CHATS   = 500;
 const MAX_CLIENT_USERS   = 100;
 const MAX_HISTORY        = 20;
 const HISTORY_STORAGE_KEY = '_adv_search_history';
+const CACHE_TIMEOUT_MS    = 10 * 60 * 1000; // 10 minutes
 
 // ─────────────────────────────────────────────────────────────
 // ABORT CONTROLLER REGISTRY
@@ -345,7 +346,8 @@ function enrichClientData({ chats, users, existingChatIds, existingUserIds, capt
  */
 export const executeSearch = createAsyncThunk(
   'search/execute',
-  async (payload, { rejectWithValue, dispatch }) => {
+  async (payload, { rejectWithValue, dispatch, getState }) => {
+    console.log('[executeSearch] DISPATCHED for query:', payload.parsedQuery?.trimmed);
     const {
       parsedQuery, context, activeCategory,
       clientData,
@@ -355,6 +357,22 @@ export const executeSearch = createAsyncThunk(
       minServerLen, maxResults,
       loggedUser,
     } = payload;
+
+    // ── 0. Check cache first ──
+    const cacheKey = parsedQuery.trimmed.toLowerCase();
+    const state = getState();
+    const cached = state.search.cache[cacheKey];
+    const now = Date.now();
+    console.log(`[Cache] whole cache memory:`, state.search.cache);
+
+    if (cached && cached.activeCategory === activeCategory) {
+      const age = now - cached.timestamp;
+      if (age < CACHE_TIMEOUT_MS) {
+        console.log('[Cache] Using cached results for:', cacheKey);
+
+        return { results: cached.results, isPartial: false, fromCache: true };
+      }
+    }
 
     const signal        = getAbortSignal();
     const resolveFields = getFields   ?? getDefaultResolveFields;
@@ -411,6 +429,17 @@ export const executeSearch = createAsyncThunk(
 
       const final = maxResults ? merged.slice(0, maxResults) : merged;
 
+      // ── 7. Cache the results ──
+      const cacheKey = parsedQuery.trimmed.toLowerCase();
+      dispatch(searchSlice.actions.setCacheEntry({
+        key: cacheKey,
+        value: {
+          results: final,
+          timestamp: Date.now(),
+          activeCategory,
+        },
+      }));
+
       return { results: final, isPartial: false };
 
     } catch (e) {
@@ -437,6 +466,9 @@ const initialState = {
   results:      [],        // all ranked results
   isLoading:    false,
   error:        null,
+
+  // Cache
+  cache: {},  // { [query]: { results, timestamp, activeCategory } }
 
   // UI state
   isOpen:           false,
@@ -542,6 +574,25 @@ const searchSlice = createSlice({
       state.results = action.payload.results;
       state.isLoading = action.payload.isPartial ?? false;
     },
+
+    // ── Cache Management ──────────────────────────────────────
+    setCacheEntry(state, action) {
+      const { key, value } = action.payload;
+      state.cache[key] = value;
+    },
+    clearExpiredCache(state) {
+      const now = Date.now();
+      const validCache = {};
+      Object.entries(state.cache).forEach(([key, entry]) => {
+        if (now - entry.timestamp < CACHE_TIMEOUT_MS) {
+          validCache[key] = entry;
+        }
+      });
+      state.cache = validCache;
+    },
+    clearAllCache(state) {
+      state.cache = {};
+    },
   },
 
   extraReducers: (builder) => {
@@ -581,6 +632,9 @@ export const {
   clearSearch,
   resetResults,
   updateResults,
+  setCacheEntry,
+  clearExpiredCache,
+  clearAllCache,
 } = searchSlice.actions;
 
 // ─────────────────────────────────────────────────────────────
@@ -603,10 +657,12 @@ export const selectContext         = (s) => sel(s).context;
 export const selectSearchHistory   = (s) => sel(s).searchHistory;
 
 /** Results filtered by active category */
-export const selectFilteredResults = (s) => {
-  const { results, activeCategory } = sel(s);
-  return activeCategory === 'all' ? results : results.filter(r => r._module === activeCategory);
-};
+export const selectFilteredResults = createSelector(
+  [selectAllResults, selectActiveCategory],
+  (results, activeCategory) => {
+    return activeCategory === 'all' ? results : results.filter(r => r._module === activeCategory);
+  }
+);
 
 /** Count of results per module (for tab badges) */
 export const selectCategoryCounts = createSelector(

@@ -39,7 +39,7 @@ import {
   // actions
   setQuery, setOpen, moveHighlight, setHighlightedIndex, setActiveCategory,
   setContext, addFilter, removeFilter, clearFilters,
-  addToHistory, clearHistory, clearSearch,
+  addToHistory, clearHistory, clearSearch, clearExpiredCache,
   // thunk
   executeSearch,
   // selectors
@@ -204,10 +204,19 @@ export function useSearch({
     }
   }, [context, currentContext, dispatch]);
 
+  // ── Periodic cache cleanup (every 5 minutes) ──
+  useEffect(() => {
+    const cleanupInterval = setInterval(() => {
+      dispatch(clearExpiredCache());
+    }, 5 * 60 * 1000); // 5 minutes
+
+    return () => clearInterval(cleanupInterval);
+  }, [dispatch]);
+
   // ── Debounce ref ──
   const debounceRef = useRef(null);
 
-  // ── Merged module weights (memo: only recalc when moduleConfig changes) ──
+ 
   const moduleWeights = useMemo(() => ({
     ...DEFAULT_MODULE_WEIGHTS,
     ...moduleConfig,
