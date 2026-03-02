@@ -17,14 +17,10 @@ import searchReducer from './searchSlice';
 export const store = configureStore({
   reducer: {
     search: searchReducer,
-    // add your other slices here:
-    // user: userReducer,
-    // chat: chatReducer,
+  
   },
   middleware: (getDefault) =>
     getDefault({
-      // ParsedQuery contains non-serializable function refs in some flows.
-      // Redux Toolkit warns about non-serializable values — suppress for search.
       serializableCheck: {
         ignoredPaths: ['search.parsedQuery'],
       },

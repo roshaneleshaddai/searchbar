@@ -374,7 +374,7 @@ export const executeSearch = createAsyncThunk(
     const cacheKey = parsedQuery.trimmed.toLowerCase();
     const state = getState();
     const cached = getCacheEntry(state.search.cache, cacheKey);
-
+    
     if (cached) {
       return { results: cached.results, isPartial: false, fromCache: true };
     }
