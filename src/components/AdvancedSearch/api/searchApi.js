@@ -274,7 +274,7 @@ export const mockModuleApis = {
   },
 
   users: async (parsedQuery, { signal }) => {
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await new Promise(resolve => setTimeout(resolve, 300));
     
     // Check if aborted
     if (signal?.aborted) {

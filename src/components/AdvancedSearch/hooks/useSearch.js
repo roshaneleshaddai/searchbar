@@ -60,7 +60,7 @@ import { needsServerFetch } from '../engine/queryParser';
 // ─────────────────────────────────────────────────────────────
 
 const DEBOUNCE_MS     = 600;
-const MIN_SERVER_LEN  = 3;
+const MIN_SERVER_LEN  = 2;
 
 const defaultGetFields = (item) => {
   switch (item._module) {
@@ -146,7 +146,7 @@ const defaultGetDedupKey = (item) => {
  * @param {Function} [config.getFields]     - (item) => string[]
  * @param {Function} [config.getDedupKey]   - (item) => string
  * @param {number}   [config.debounceMs]    - default 180
- * @param {number}   [config.minServerLen]  - default 3
+ * @param {number}   [config.minServerLen]  - default 2
  * @param {number}   [config.maxResults]    - cap result count
  *
  * Callbacks:

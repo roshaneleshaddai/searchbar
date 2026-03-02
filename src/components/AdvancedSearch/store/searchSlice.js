@@ -20,6 +20,16 @@ import { createSlice, createAsyncThunk, createSelector } from '@reduxjs/toolkit'
 import { parseQuery} from '../engine/queryParser';
 import { rankResults, deduplicateBy, } from '../engine/scorer';
 import moduleApis from '../api/searchApi';
+import {
+  CACHE_TIMEOUT_MS,
+  getCacheEntry,
+  findBestPrefixCache,
+  filterCachedResults,
+  setCacheEntry as writeCacheEntry,
+  setModuleCacheEntry as writeModuleCacheEntry,
+  clearExpiredEntries,
+  clearAll as clearAllCacheEntries,
+} from './searchCache';
 
 // ─────────────────────────────────────────────────────────────
 // CONSTANTS
@@ -33,7 +43,7 @@ export const  DEFAULT_MODULE_WEIGHTS = {
   messages:    1.0,
   files:       0.95,
   bots:        0.9,
-  threads:     0.85,
+  threads:     0.85,  
   widgets:     0.75,
   apps:        0.75,
   connections: 0.6,
@@ -62,7 +72,6 @@ const MAX_CLIENT_CHATS   = 500;
 const MAX_CLIENT_USERS   = 100;
 const MAX_HISTORY        = 20;
 const HISTORY_STORAGE_KEY = '_adv_search_history';
-const CACHE_TIMEOUT_MS    = 10 * 60 * 1000; // 10 minutes
 
 // ─────────────────────────────────────────────────────────────
 // ABORT CONTROLLER REGISTRY
@@ -215,7 +224,7 @@ function runClientSearch(chats, users, queryLower, loggedUserZuid) {
  * Also captures globalsearch and users-API results into the provided
  * `captured` object so they can be appended to clientData later.
  *
- * @returns {Promise[]} serverPromises
+ * @returns {{ module: string, promise: Promise<object[]> }[]} serverTasks
  */
 function buildServerPromises({
   parsedQuery, signal, loggedUserZuid,
@@ -223,11 +232,12 @@ function buildServerPromises({
   existingChatIds, existingUserIds,
   captured,  // { globalSearchResults: [], usersApiResults: [] }
 }) {
-  const promises = [];
+  const tasks = [];
 
   // ── Global search API ──
-  promises.push(
-    moduleApis.globalsearch(parsedQuery, { signal })
+  tasks.push({
+    module: 'globalsearch',
+    promise: moduleApis.globalsearch(parsedQuery, { signal })
       .then(raw => {
         captured.globalSearchResults = (Array.isArray(raw) ? raw : []).map(item => ({
           ...item,
@@ -243,12 +253,13 @@ function buildServerPromises({
         if (e?.name !== 'AbortError') console.warn('[Search] Global search failed:', e?.message);
         return [];
       }),
-  );
+  });
 
   // ── Users API (captured separately for clientData enrichment) ──
   if (moduleApis.users && enabledModules.includes('users') && (activeCategory === 'all' || activeCategory === 'users')) {
-    promises.push(
-      moduleApis.users(parsedQuery, { signal })
+    tasks.push({
+      module: 'users',
+      promise: moduleApis.users(parsedQuery, { signal })
         .then(raw => {
           const list = Array.isArray(raw) ? raw : [];
           captured.usersApiResults = list
@@ -260,7 +271,7 @@ function buildServerPromises({
           if (e?.name !== 'AbortError') console.warn('[Search] Module "users" failed:', e?.message);
           return [];
         }),
-    );
+    });
   }
 
   // ── Generic module helper ──
@@ -269,8 +280,9 @@ function buildServerPromises({
     if (!enabledModules.includes(mod)) return;
     if (activeCategory !== 'all' && activeCategory !== mod) return;
 
-    promises.push(
-      apiFn(parsedQuery, { signal })
+    tasks.push({
+      module: mod,
+      promise: apiFn(parsedQuery, { signal })
         .then(raw => {
           const list = Array.isArray(raw) ? raw : [];
           return list
@@ -281,7 +293,7 @@ function buildServerPromises({
           if (e?.name !== 'AbortError') console.warn(`[Search] Module "${mod}" failed:`, e?.message);
           return [];
         }),
-    );
+    });
   };
 
   addModule('chats',       moduleApis.chats,       existingChatIds, 'chatid');
@@ -296,7 +308,7 @@ function buildServerPromises({
   addModule('connections', moduleApis.connections, null,            'id');
   addModule('settings',    moduleApis.settings,    null,            'id');
 
-  return promises;
+  return tasks;
 }
 
 /**
@@ -347,7 +359,7 @@ function enrichClientData({ chats, users, existingChatIds, existingUserIds, capt
 export const executeSearch = createAsyncThunk(
   'search/execute',
   async (payload, { rejectWithValue, dispatch, getState }) => {
-    console.log('[executeSearch] DISPATCHED for query:', payload.parsedQuery?.trimmed);
+  
     const {
       parsedQuery, context, activeCategory,
       clientData,
@@ -361,23 +373,33 @@ export const executeSearch = createAsyncThunk(
     // ── 0. Check cache first ──
     const cacheKey = parsedQuery.trimmed.toLowerCase();
     const state = getState();
-    const cached = state.search.cache[cacheKey];
-    const now = Date.now();
-    console.log(`[Cache] whole cache memory:`, state.search.cache);
+    const cached = getCacheEntry(state.search.cache, cacheKey);
 
-    if (cached && cached.activeCategory === activeCategory) {
-      const age = now - cached.timestamp;
-      if (age < CACHE_TIMEOUT_MS) {
-        console.log('[Cache] Using cached results for:', cacheKey);
-
-        return { results: cached.results, isPartial: false, fromCache: true };
-      }
+    if (cached) {
+      return { results: cached.results, isPartial: false, fromCache: true };
     }
 
     const signal        = getAbortSignal();
     const resolveFields = getFields   ?? getDefaultResolveFields;
     const resolveDedupKey = getDedupKey ?? getDefaultDedupKey;
     const getWeight     = (item) => moduleWeights[item._module] ?? DEFAULT_MODULE_WEIGHTS[item._module];
+
+    const nearestCache = findBestPrefixCache(state.search.cache, cacheKey);
+    let prefixFilteredResults = [];
+    if (nearestCache) {
+      if (nearestCache.direction === 'longer') {
+        // Cached key is longer — every result already contains the query string
+        prefixFilteredResults = nearestCache.results;
+      } else {
+        // Cached key is shorter — narrow down to items matching the longer query
+        prefixFilteredResults = filterCachedResults(
+          nearestCache.results, parsedQuery.trimmed, resolveFields,
+        );
+      }
+      if (prefixFilteredResults.length > 0) {
+        dispatch(searchSlice.actions.updateResults({ results: prefixFilteredResults, isPartial: true }));
+      }
+    }
 
     const { chats = [], users = [] } = clientData;
     const loggedUserZuid = loggedUser?.Zuid;
@@ -390,16 +412,28 @@ export const executeSearch = createAsyncThunk(
       const queryLower = parsedQuery.trimmed.toLowerCase();
       const { clientChats, clientUsers, clientResults } = runClientSearch(chats, users, queryLower, loggedUserZuid);
 
-      console.log('Client Results:', clientResults);
+      
 
-      // Dispatch partial results immediately
-      dispatch(searchSlice.actions.updateResults({ results: clientResults, isPartial: true }));
+      // Dispatch client results (merge with any prefix-cached results already shown)
+      const clientMerged = prefixFilteredResults.length > 0
+        ? [
+            ...clientResults,
+            ...prefixFilteredResults.filter(
+              pItem => !clientResults.some(cItem => resolveDedupKey(cItem) === resolveDedupKey(pItem)),
+            ),
+          ]
+        : clientResults;
+      dispatch(searchSlice.actions.updateResults({ results: clientMerged, isPartial: true }));
 
-      // ── 3. Server search (when client results are sparse) ──
-      const shouldFetchServer = clientChats.length < 15 || clientUsers.length < 15;
+      // ── 3. Server search ──
+      // Case 2: if extending a prefix query whose cache had limited results,
+      //         always fetch server — the shorter query may not have surfaced
+      //         all matches for the longer term.
+      const prefixHadLimitedResults = nearestCache != null && nearestCache.totalResultCount < 20;
+      const shouldFetchServer = clientChats.length < 15 || clientUsers.length < 15 || prefixHadLimitedResults;
       const captured = { globalSearchResults: [], usersApiResults: [] };
 
-      const serverPromises = shouldFetchServer
+      const serverTasks = shouldFetchServer
         ? buildServerPromises({
             parsedQuery, signal, loggedUserZuid,
             enabledModules, activeCategory,
@@ -408,8 +442,42 @@ export const executeSearch = createAsyncThunk(
           })
         : [];
 
+      // Track keys already dispatched to the UI so we only append genuinely new items
+      const dispatchedKeys = new Set();
+      clientMerged.forEach(item => dispatchedKeys.add(resolveDedupKey(item)));
+
+      const progressiveTasks = serverTasks.map(({ module, promise }) =>
+        promise.then((moduleResults) => {
+          if (!Array.isArray(moduleResults) || moduleResults.length === 0) return [];
+
+          // Rank only this module's batch
+          const ranked = rankResults(
+            moduleResults,
+            parsedQuery.keywords,
+            parsedQuery.phrase,
+            resolveFields,
+            getWeight,
+            scorerConfig,
+          );
+
+          // Keep only items not already on screen
+          const newItems = deduplicateBy(ranked, resolveDedupKey)
+            .filter(item => !dispatchedKeys.has(resolveDedupKey(item)));
+
+          // Register them so later modules won't re-add
+          newItems.forEach(item => dispatchedKeys.add(resolveDedupKey(item)));
+
+          if (newItems.length > 0) {
+            dispatch(searchSlice.actions.appendResults({ results: newItems }));
+           
+          }
+
+          return moduleResults;
+        }),
+      );
+
       // ── 4. Await all server responses ──
-      const serverResponses = await Promise.all(serverPromises);
+      const serverResponses = await Promise.all(progressiveTasks);
       const rawServer = serverResponses.flat();
 
       // ── 5. Enrich clientData with unique server results ──
@@ -429,15 +497,10 @@ export const executeSearch = createAsyncThunk(
 
       const final = maxResults ? merged.slice(0, maxResults) : merged;
 
-      // ── 7. Cache the results ──
-      const cacheKey = parsedQuery.trimmed.toLowerCase();
-      dispatch(searchSlice.actions.setCacheEntry({
-        key: cacheKey,
-        value: {
-          results: final,
-          timestamp: Date.now(),
-          activeCategory,
-        },
+// ── 7. Cache the results (per-module) ──
+      dispatch(searchSlice.actions.setCacheResults({
+        query: parsedQuery.trimmed.toLowerCase(),
+        results: final,
       }));
 
       return { results: final, isPartial: false };
@@ -468,7 +531,7 @@ const initialState = {
   error:        null,
 
   // Cache
-  cache: {},  // { [query]: { results, timestamp, activeCategory } }
+  cache: {},  
 
   // UI state
   isOpen:           false,
@@ -575,23 +638,26 @@ const searchSlice = createSlice({
       state.isLoading = action.payload.isPartial ?? false;
     },
 
+    // ── Append-only update (push new items to the bottom, no re-render of existing) ──
+    appendResults(state, action) {
+      state.results = [...state.results, ...action.payload.results];
+      // isLoading stays true — more modules may still be pending
+    },
+
     // ── Cache Management ──────────────────────────────────────
-    setCacheEntry(state, action) {
-      const { key, value } = action.payload;
-      state.cache[key] = value;
+    setCacheResults(state, action) {
+      const { query, results } = action.payload;
+      writeCacheEntry(state.cache, query, results);
+    },
+    setModuleCache(state, action) {
+      const { query, module, results } = action.payload;
+      writeModuleCacheEntry(state.cache, query, module, results);
     },
     clearExpiredCache(state) {
-      const now = Date.now();
-      const validCache = {};
-      Object.entries(state.cache).forEach(([key, entry]) => {
-        if (now - entry.timestamp < CACHE_TIMEOUT_MS) {
-          validCache[key] = entry;
-        }
-      });
-      state.cache = validCache;
+      state.cache = clearExpiredEntries(state.cache);
     },
     clearAllCache(state) {
-      state.cache = {};
+      state.cache = clearAllCacheEntries();
     },
   },
 
@@ -632,7 +698,9 @@ export const {
   clearSearch,
   resetResults,
   updateResults,
-  setCacheEntry,
+  setCacheResults,
+  setModuleCache,
+  appendResults,
   clearExpiredCache,
   clearAllCache,
 } = searchSlice.actions;

@@ -77,6 +77,6 @@ export function serializeQuery(pq) {
 }
 
 /** Should we call server APIs for this query? */
-export function needsServerFetch(pq, minLen = 3) {
+export function needsServerFetch(pq, minLen = 2) {
   return pq.trimmed.length >= minLen || Object.keys(pq.filters).length > 0;
 }
