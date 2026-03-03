@@ -77,6 +77,7 @@ No layer reaches upward. The engine never imports Redux. The hook never imports 
 | **Primitives** | `SearchPrimitive.jsx` | Headless compound components (`Root`, `Input`, `Results`, etc.) |
 | **Hook** | `useSearch.js` | Bridge: connects Redux ↔ UI. Manages debouncing, config refs, prop getters. |
 | **Store** | `searchSlice.js` | Redux slice: state, reducers, async thunk, selectors. All search logic. |
+| **Cache** | `searchCache.js` | Per-module cache with sorted key index, prefix lookup, expiry, and filtering. |
 | **Engine** | `queryParser.js` | Parses raw string → `ParsedQuery` (keywords, phrase, filters). |
 | **Engine** | `scorer.js` | Pure scoring: `detectMatch`, `scoreQuery`, `rankResults`, `deduplicateBy`. |
 | **API** | `searchApi.js` | Server API adapters (real `fetch` or mock with `servermockData.js`). |
@@ -202,45 +203,74 @@ This is the heart of the system. Here's every step with all conditions:
 cacheKey = parsedQuery.trimmed.toLowerCase()
 
 CONDITION: cache[cacheKey] exists
-  AND cache[cacheKey].activeCategory === activeCategory
-  AND (Date.now() - cache[cacheKey].timestamp) < 10 minutes?
+  AND at least one module within cache[cacheKey].modules
+      has (Date.now() - module.timestamp) < 10 minutes?
 
-  YES → return { results: cached.results, isPartial: false, fromCache: true }
+  YES → Combine results from all non-expired modules
+         → return { results: combined, isPartial: false, fromCache: true }
          (thunk exits immediately, no network calls)
 
   NO  → continue to Step 0b
 ```
 
-**When this triggers:** User typed the exact same query recently (within 10 minutes), in the same category tab.
+**How it works internally:**
+- The cache stores results per-module: `cache[key].modules.users`, `cache[key].modules.chats`, etc.
+- `getCacheEntry()` calls `combineModules()` which iterates all modules and only includes those whose individual `timestamp` is still within the 10-minute window.
+- If ALL modules are expired, the entry is treated as a cache miss.
+
+**When this triggers:** User typed the exact same query recently and at least one module's results are still fresh (within 10 minutes).
 
 ---
 
 ### Step 0b — Prefix Cache Check
 
 ```
-Find the longest cached key K where:
-  - K.length < cacheKey.length
-  - cacheKey.startsWith(K)
-  - cache[K].activeCategory === activeCategory
-  - (Date.now() - cache[K].timestamp) < 10 minutes
+Scan the sorted key index (_sortedKeys, sorted by length DESC) for the
+cached key K closest in length to cacheKey, checking BOTH directions:
 
-CONDITION: Found a prefix cache entry?
+  Direction 1 — Shorter prefix:
+    K.length < cacheKey.length AND cacheKey.startsWith(K)
+    Example: cached "market", query "marketing"
+    → Results need filtering (narrowing down)
+
+  Direction 2 — Longer superset:
+    K.length > cacheKey.length AND K.startsWith(cacheKey)
+    Example: cached "marketing", query "market"
+    → Results can be used directly (every result already matches)
+
+  Selection: pick K with smallest Math.abs(K.length - cacheKey.length)
+  Validity: at least one module in cache[K] must be non-expired
+  Note: activeCategory is NOT checked
+
+CONDITION: Found a related cache entry?
   YES →
-    1. Filter cached results to only items whose searchable fields
-       contain the longer query string (case-insensitive .includes())
-    2. If any filtered results exist:
-       dispatch(updateResults({ results: prefixFilteredResults, isPartial: true }))
-       → UI instantly shows these (before client search even runs)
+    IF direction === 'shorter':
+      Filter cached results to only items whose searchable fields
+      contain the longer query string (case-insensitive .includes())
+    IF direction === 'longer':
+      Use all cached results as-is (they already match)
+
+    If any results exist:
+      dispatch(updateResults({ results: prefixFilteredResults, isPartial: true }))
+      → UI instantly shows these (before client search even runs)
 
   NO  → prefixFilteredResults = [] (no instant preview)
 ```
 
-**Example:**
+**Sorted key index:** The module maintains an internal `_sortedKeys` array (sorted by key length descending) outside Redux. Keys are inserted via binary search (`indexInsert`) when cache entries are written, and removed/rebuilt during cleanup. This allows the prefix scan to find the longest (and thus closest) match first and terminate early.
+
+**Example (shorter prefix):**
 - Cache has `"market"` → 7 results (Market Analytics, Marketing Lead, Marketing Manager, ...)
 - User types `"marketing"`
-- Prefix cache finds `"market"`, filters its 7 results to only those containing "marketing"
+- Prefix cache finds `"market"` (direction: shorter), filters its 7 results to only those containing "marketing"
 - Instantly shows: Marketing Lead, Marketing Manager, Marketing Strategist, Marketing Intern (4 results)
 - Market Analytics and Market Ops are filtered OUT (they don't contain "marketing")
+
+**Example (longer superset):**
+- Cache has `"marketing"` → 4 results
+- User deletes a character, now query is `"marketin"`
+- Prefix cache finds `"marketing"` (direction: longer), uses all 4 results directly
+- No filtering needed — every item that matched "marketing" also matches "marketin"
 
 ---
 
@@ -417,21 +447,33 @@ After all server promises finish, this mutates the original `clientData` arrays 
 ### Step 7 — Cache the Results
 
 ```
-dispatch(setCacheEntry({
-  key:   cacheKey,   // e.g. "marketing"
-  value: {
-    results:        final,
-    timestamp:      Date.now(),
-    activeCategory: activeCategory,
-  },
+dispatch(setCacheResults({
+  query:   parsedQuery.trimmed.toLowerCase(),   // e.g. "marketing"
+  results: final,                               // flat array with _module on each item
 }))
 ```
+
+Internally, `setCacheResults` calls `writeCacheEntry(state.cache, query, results)` which:
+1. Calls `splitByModule(results)` → groups items by `_module` field
+2. Stores each group with its own `timestamp: Date.now()`
+3. Inserts the query key into the sorted key index via `indexInsert()`
 
 **Cache entry structure:**
 ```js
 state.cache = {
-  "market":    { results: [...], timestamp: 1709337600000, activeCategory: "all" },
-  "marketing": { results: [...], timestamp: 1709337602000, activeCategory: "all" },
+  "market": {
+    modules: {
+      users:    { results: [user1, user2],    timestamp: 1709337600000 },
+      chats:    { results: [chat1],           timestamp: 1709337600000 },
+      channels: { results: [chan1, chan2],     timestamp: 1709337600000 },
+    }
+  },
+  "marketing": {
+    modules: {
+      users:    { results: [user1],           timestamp: 1709337602000 },
+      messages: { results: [msg1, msg2, msg3],timestamp: 1709337602000 },
+    }
+  },
 }
 ```
 
@@ -522,7 +564,7 @@ If user types again before searches finish:
   results:          [],          // Current displayed results
   isLoading:        false,       // True during search
   error:            null,        // Error message string
-  cache:            {},          // { [queryKey]: { results, timestamp, activeCategory } }
+  cache:            {},          // Per-module structure — see Section 11 for details
   isOpen:           false,       // Dropdown open?
   highlightedIndex: -1,          // Keyboard navigation index
   activeCategory:   'all',       // Current tab filter
@@ -543,8 +585,10 @@ If user types again before searches finish:
 | `setContext(ctx)` | Changes context + resets category to 'all' |
 | `addFilter({ key, value })` | Adds filter + rebuilds parsedQuery with filters |
 | `clearSearch()` | Resets everything to initial state |
-| `setCacheEntry({ key, value })` | Stores query results in cache |
-| `clearExpiredCache()` | Removes entries older than 10 minutes |
+| `setCacheResults({ query, results })` | Splits results by `_module` and stores per-module in cache |
+| `setModuleCache({ query, module, results })` | Stores/updates results for a single module within a cache entry |
+| `clearExpiredCache()` | Removes expired entries and prunes expired modules within valid entries |
+| `clearAllCache()` | Clears the entire cache |
 
 ### Extra Reducers (thunk lifecycle):
 
@@ -558,26 +602,76 @@ If user types again before searches finish:
 
 ## 11. Cache System — Full Behavior
 
+**File:** `searchCache.js`
+
+### Cache Structure (Per-Module):
+
+Results are stored split by `_module`, so each module can be cached, retrieved, expired, or updated independently:
+
+```js
+state.cache = {
+  "market": {
+    modules: {
+      users:    { results: [...], timestamp: 1709337600000 },
+      chats:    { results: [...], timestamp: 1709337600000 },
+      channels: { results: [...], timestamp: 1709337601000 },
+    }
+  },
+  "marketing": {
+    modules: {
+      users:    { results: [...], timestamp: 1709337602000 },
+      messages: { results: [...], timestamp: 1709337603000 },
+    }
+  },
+}
+```
+
 ### Cache Entry Lifecycle:
 
-1. **Write:** After every successful search, `setCacheEntry` stores `{ results, timestamp, activeCategory }`
-2. **Exact Hit:** If same query + same category + age < 10 min → return cached, skip everything
-3. **Prefix Hit:** If typing an extension of a cached query → instantly filter + display cached results
-4. **Expiry:** `clearExpiredCache` runs every 5 minutes (via `useEffect` interval in hook)
-5. **Clear All:** `clearAllCache` available for manual reset
+1. **Write:** After every successful search, `setCacheEntry()` calls `splitByModule(results)` to group results by `_module`, then stores each group with its own `timestamp`.
+2. **Per-module write:** `setModuleCacheEntry()` can store/update results for a single module without touching other modules in the same query entry.
+3. **Exact Hit:** If same query exists and at least one module is non-expired → combine valid modules' results and return instantly.
+4. **Prefix Hit:** If a related cached key exists (shorter OR longer) → instantly show filtered/direct results.
+5. **Expiry:** `clearExpiredCache` runs every 5 minutes (via `useEffect` interval in hook). It removes fully expired entries AND prunes expired individual modules within still-valid entries.
+6. **Clear All:** `clearAllCache` resets the cache and the sorted key index.
+
+**Note:** `activeCategory` is NOT stored in or checked by the cache. A cached result for `"market"` is reusable regardless of which category tab is active — the category filtering happens at the selector level (`selectFilteredResults`).
+
+### Sorted Key Index:
+
+A `_sortedKeys` array is maintained outside Redux (not serializable), sorted by key length descending. This enables efficient prefix lookups:
+
+- **`indexInsert(key)`** — Binary-inserts a key when a cache entry is written. No-op if already present.
+- **`indexRemove(key)`** — Removes a key when an entry is pruned.
+- **`indexRebuild(cache)`** — Reconstructs the full index from a cache object (after cleanup).
+
+Because keys are sorted longest-first, `findBestPrefixCache()` can find the closest match quickly.
+
+### Validity Checks:
+
+- **Entry-level** (`isEntryValid`): Returns `true` if *at least one* module within the entry has a non-expired timestamp.
+- **Module-level** (`isModuleValid`): Returns `true` if a single module's timestamp is within the 10-minute window.
+- **`combineModules()`**: When reading a cache entry, only non-expired modules' results are included in the combined output. Expired modules are silently excluded.
 
 ### Prefix Cache — Detailed Logic:
 
 ```
 User types "marketing", cache has "mar" and "market":
 
-findBestPrefixCache() scans ALL cache keys:
-  "mar"    → length 3, "marketing".startsWith("mar")    ✓, same category ✓, not expired ✓
-  "market" → length 6, "marketing".startsWith("market") ✓, same category ✓, not expired ✓
+findBestPrefixCache() scans _sortedKeys (sorted by length DESC):
 
-  Picks "market" (longest match, length 6 > 3)
+  For each key, compute dist = Math.abs(key.length - "marketing".length)
+  Skip keys where dist >= current best distance
 
-filterCachedResults(cache["market"].results, "marketing", resolveFields):
+  "market" → length 6, "marketing".startsWith("market") ✓, not expired ✓
+            dist = |6 - 9| = 3
+  "mar"    → length 3, "marketing".startsWith("mar") ✓, not expired ✓
+            dist = |3 - 9| = 6 → worse than 3, skipped
+
+  Picks "market" (closest in length, dist = 3, direction = 'shorter')
+
+Since direction = 'shorter', filter is needed:
+filterCachedResults(combineModules(cache["market"]), "marketing", resolveFields):
   For each cached item, check if ANY of its searchable fields
   .toLowerCase().includes("marketing")
 
@@ -589,15 +683,19 @@ filterCachedResults(cache["market"].results, "marketing", resolveFields):
 → Instantly dispatched to UI while full search runs in background
 ```
 
+### Per-Module Prefix Cache:
+
+`getModulePrefixCache(cache, query, module)` — retrieves cached results for a specific module from the nearest shorter prefix. Scans `_sortedKeys` and returns the first valid match. Useful for module-level incremental lookups.
+
 ### Cache Invalidation Conditions:
 
 | Condition | Behavior |
 |---|---|
-| Same query, same category, < 10 min | Full cache hit, no network calls |
-| Same query, different category | Cache miss, full search |
-| Same query, same category, ≥ 10 min | Cache expired, full search |
-| Prefix query exists, < 20 results | Prefix preview shown + always fetch server |
-| Prefix query exists, ≥ 20 results | Prefix preview shown + normal server decision applies |
+| Same query, at least one module < 10 min | Full cache hit, no network calls |
+| Same query, all modules ≥ 10 min | Cache expired, full search |
+| Related prefix/superset query exists | Prefix preview shown (filtered or direct) + full search continues |
+| Prefix cache had < 20 results | Prefix preview shown + always fetch server |
+| Prefix cache had ≥ 20 results | Prefix preview shown + normal server decision applies |
 
 ---
 
@@ -683,7 +781,7 @@ USER TYPES "marketing"
 ┌─ executeSearch thunk ─────────────────────────────────────────────┐
 │                                                                   │
 │  ┌─ Step 0: Exact Cache ──────────────────────────────────────┐   │
-│  │  cache["marketing"] exists + same category + < 10 min?     │   │
+│  │  cache["marketing"] exists + any module < 10 min?          │   │
 │  │  → NO → continue                                          │   │
 │  └────────────────────────────────────────────────────────────┘   │
 │                                                                   │
@@ -764,7 +862,9 @@ USER TYPES "marketing"
 │  └────────────────────────────────────────────────────────────┘   │
 │                                                                   │
 │  ┌─ Step 7: Cache ───────────────────────────────────────────┐   │
-│  │  cache["marketing"] = { results, timestamp, category }     │   │
+│  │  cache["marketing"] = { modules: {                         │   │
+│  │    users: { results, timestamp },                          │   │
+│  │    chats: { results, timestamp }, ... } }                  │   │
 │  └────────────────────────────────────────────────────────────┘   │
 │                                                                   │
 │  return { results: final, isPartial: false }                      │

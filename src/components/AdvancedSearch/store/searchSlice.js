@@ -19,6 +19,7 @@
 import { createSlice, createAsyncThunk, createSelector } from '@reduxjs/toolkit';
 import { parseQuery} from '../engine/queryParser';
 import { rankResults, deduplicateBy, } from '../engine/scorer';
+import { levenshtein } from '../engine/spellCorrector';
 import moduleApis from '../api/searchApi';
 import {
   CACHE_TIMEOUT_MS,
@@ -185,11 +186,14 @@ function buildExclusionSets(chats, users, loggedUserZuid) {
 
 /**
  * Client-side search: fast, synchronous filtering of local data.
- * Returns { clientChats, clientUsers, clientResults }.
+ *
+ * Returns:
+ *  - clientChats / clientUsers / clientResults — startsWith-filtered results
+ *  - allMappedChats / allMappedUsers — full mapped arrays (for contains search later)
  */
 function runClientSearch(chats, users, queryLower, loggedUserZuid) {
-  // Chats: match title prefix, derive _module from chat_type
-  const clientChats = chats.slice(0, MAX_CLIENT_CHATS)
+  // ── Map all chats (derive _module, _source, id) ──
+  const allMappedChats = chats.slice(0, MAX_CLIENT_CHATS)
     .map(c => ({
       ...c,
       title:   c.title.replace(/^[@#]/, ''),
@@ -198,7 +202,10 @@ function runClientSearch(chats, users, queryLower, loggedUserZuid) {
       id:      String(c.chat_type) === '1'
         ? getOtherUserId(c.recipantssummary, loggedUserZuid, c.title) || c.chatid
         : c.chatid,
-    }))
+    }));
+
+  // ── StartsWith filter on chats ──
+  const clientChats = allMappedChats
     .filter(c => c.title?.toLowerCase().startsWith(queryLower))
     .sort((a, b) => (b.score || 0) - (a.score || 0));
 
@@ -207,16 +214,23 @@ function runClientSearch(chats, users, queryLower, loggedUserZuid) {
     clientChats.filter(c => c._module === 'users').map(c => String(c.id)),
   );
 
-  // Users: match name/email prefix, skip those already in chat list
-  const clientUsers = users.slice(0, MAX_CLIENT_USERS)
-    .map(u => ({ ...u, _module: 'users', _source: 'client', id: u.Zuid || u.zuid || u.id }))
+  // ── Map all users ──
+  const allMappedUsers = users.slice(0, MAX_CLIENT_USERS)
+    .map(u => ({ ...u, _module: 'users', _source: 'client', id: u.Zuid || u.zuid || u.id }));
+
+  // ── StartsWith filter on users ──
+  const clientUsers = allMappedUsers
     .filter(u => {
       const nameMatch  = (u.full_name || u.display_name || '').toLowerCase().startsWith(queryLower);
       const emailMatch = (u.email || '').toLowerCase().startsWith(queryLower);
       return (nameMatch || emailMatch) && !clientChatZuids.has(String(u.id));
     });
 
-  return { clientChats, clientUsers, clientResults: [...clientChats, ...clientUsers] };
+  return {
+    clientChats, clientUsers,
+    clientResults: [...clientChats, ...clientUsers],
+    allMappedChats, allMappedUsers,
+  };
 }
 
 /**
@@ -338,6 +352,77 @@ function enrichClientData({ chats, users, existingChatIds, existingUserIds, capt
 }
 
 // ─────────────────────────────────────────────────────────────
+// CONTAINS + FUZZY (TYPO-TOLERANT) SEARCH
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Search `items` using **contains** matching AND **Levenshtein
+ * typo tolerance**. Returns items not already in `excludeKeys`.
+ *
+ * A match is found when ANY field of the item satisfies:
+ *   1. field.includes(query)        — substring / contains match
+ *   2. Any word in the field has Levenshtein distance ≤ maxDistance
+ *      from any word in the query   — typo-tolerant match
+ *
+ * Matched items are added to `excludeKeys` so callers can chain
+ * multiple calls without duplicates.
+ *
+ * @param {Array}    items           - Pre-mapped items (must have _module, id, etc.)
+ * @param {string}   queryLower      - Lowercased query string
+ * @param {Function} resolveFields   - (item) => string[]
+ * @param {Set}      excludeKeys     - Dedup keys of items already in results (mutated)
+ * @param {Function} resolveDedupKey - (item) => string
+ * @param {number}   [maxDistance=2] - Levenshtein tolerance
+ * @returns {Array}  New matches (not in excludeKeys)
+ */
+function runContainsFuzzySearch(
+  items, queryLower, resolveFields,
+  excludeKeys, resolveDedupKey, maxDistance = 2,
+) {
+  const queryWords = queryLower.split(/\s+/).filter(w => w.length >= 2);
+  const results = [];
+
+  for (const item of items) {
+    const key = resolveDedupKey(item);
+    if (excludeKeys.has(key)) continue;
+
+    const fields = resolveFields(item);
+    let matched = false;
+
+    for (const rawField of fields) {
+      if (!rawField) continue;
+      const fieldLower = String(rawField).toLowerCase();
+
+      // ── Contains check ──
+      if (fieldLower.includes(queryLower)) {
+        matched = true;
+        break;
+      }
+
+      // ── Typo-tolerant check: word-level Levenshtein ──
+      const fieldWords = fieldLower.split(/\s+/).filter(w => w.length >= 2);
+      for (const qw of queryWords) {
+        for (const fw of fieldWords) {
+          if (levenshtein(qw, fw, maxDistance) <= maxDistance) {
+            matched = true;
+            break;
+          }
+        }
+        if (matched) break;
+      }
+      if (matched) break;
+    }
+
+    if (matched) {
+      results.push(item);
+      excludeKeys.add(key);
+    }
+  }
+
+  return results;
+}
+
+// ─────────────────────────────────────────────────────────────
 // ASYNC THUNK: executeSearch
 // The core search pipeline. Runs client + server, merges, scores.
 // ─────────────────────────────────────────────────────────────
@@ -410,7 +495,10 @@ export const executeSearch = createAsyncThunk(
     try {
       // ── 2. Client search (synchronous, instant) ──
       const queryLower = parsedQuery.trimmed.toLowerCase();
-      const { clientChats, clientUsers, clientResults } = runClientSearch(chats, users, queryLower, loggedUserZuid);
+      const {
+        clientChats, clientUsers, clientResults,
+        allMappedChats, allMappedUsers,
+      } = runClientSearch(chats, users, queryLower, loggedUserZuid);
 
       
 
@@ -497,13 +585,34 @@ export const executeSearch = createAsyncThunk(
 
       const final = maxResults ? merged.slice(0, maxResults) : merged;
 
-// ── 7. Cache the results (per-module) ──
+      // ── 7. Cache the startsWith results (per-module) ──
       dispatch(searchSlice.actions.setCacheResults({
         query: parsedQuery.trimmed.toLowerCase(),
         results: final,
       }));
 
-      return { results: final, isPartial: false };
+      // ── 8. Contains + fuzzy search on client data ──
+      const containsExcludeKeys = new Set(final.map(item => resolveDedupKey(item)));
+      const allMappedClient = [...allMappedChats, ...allMappedUsers];
+      const containsClientResults = runContainsFuzzySearch(
+        allMappedClient, queryLower, resolveFields,
+        containsExcludeKeys, resolveDedupKey,
+      );
+      if (containsClientResults.length > 0) {
+        dispatch(searchSlice.actions.appendResults({ results: containsClientResults }));
+      }
+
+      // ── 9. Contains + fuzzy search on server data ──
+      const containsServerResults = runContainsFuzzySearch(
+        rawServer, queryLower, resolveFields,
+        containsExcludeKeys, resolveDedupKey,
+      );
+      if (containsServerResults.length > 0) {
+        dispatch(searchSlice.actions.appendResults({ results: containsServerResults }));
+      }
+
+      const finalAll = [...final, ...containsClientResults, ...containsServerResults];
+      return { results: finalAll, isPartial: false };
 
     } catch (e) {
       if (e?.name === 'AbortError') return { results: [], aborted: true };
