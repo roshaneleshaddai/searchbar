@@ -193,7 +193,7 @@ function Highlight({ text = '', query = '' }) {
     <span>
       {parts.map((part, i) =>
         part.toLowerCase() === query.toLowerCase()
-          ? <mark key={i} style={{ background: 'rgba(124,92,252,0.35)', color: '#d4bbff', borderRadius: 3, padding: '0 2px' }}>{part}</mark>
+          ? <mark key={i} style={{ borderRadius: 3, padding: '0 2px' }}>{part}</mark>
           : <span key={i}>{part}</span>
       )}
     </span>
@@ -567,14 +567,14 @@ export default function AdvancedSearch({
 
           {/* Results */}
           <SearchPrimitive.ResultList limit={fullPage ? 50 : 8}>
-            {(item, idx, isHighlighted, itemProps) => (
+            {(item, idx, isHighlighted, itemProps, query) => (
               <ResultItem
                 key={`${item._module}-${item.id || idx}`}
                 item={item}
                 index={idx}
                 isHighlighted={isHighlighted}
                 itemProps={itemProps}
-                query={item._searchQuery || ''}
+                query={query}
               />
             )}
           </SearchPrimitive.ResultList>

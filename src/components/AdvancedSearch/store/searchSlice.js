@@ -69,8 +69,8 @@ export const CONTEXT_CATEGORIES = {
   create_event:    ['users','conversations','rooms'],
 };
 
-const MAX_CLIENT_CHATS   = 500;
-const MAX_CLIENT_USERS   = 100;
+const MAX_CLIENT_CHATS   = 5000;
+const MAX_CLIENT_USERS   = 5000;
 const MAX_HISTORY        = 20;
 const HISTORY_STORAGE_KEY = '_adv_search_history';
 
@@ -93,7 +93,7 @@ function getAbortSignal() {
 
 /** Map of _module → fields used for scoring/display. */
 const MODULE_FIELD_MAP = {
-  users:    (i) => [i.full_name, i.email],
+  users:    (i) => [i.full_name, i.email || i.email_id],
   chats:    (i) => [i.dname, i.recipantssummary, i.recipientssumm, i.name, i.title],
   channels: (i) => [i.title],
   messages: (i) => [i.message, i.msg, i.ctitle],
@@ -222,7 +222,7 @@ function runClientSearch(chats, users, queryLower, loggedUserZuid) {
   const clientUsers = allMappedUsers
     .filter(u => {
       const nameMatch  = (u.full_name || u.display_name || '').toLowerCase().startsWith(queryLower);
-      const emailMatch = (u.email || '').toLowerCase().startsWith(queryLower);
+      const emailMatch = (u.email || u.email_id || '').toLowerCase().startsWith(queryLower);
       return (nameMatch || emailMatch) && !clientChatZuids.has(String(u.id));
     });
 
@@ -393,22 +393,24 @@ function runContainsFuzzySearch(
       if (!rawField) continue;
       const fieldLower = String(rawField).toLowerCase();
 
-      // ── Contains check ──
+      // ── Contains check (full field, untokenized) ──
       if (fieldLower.includes(queryLower)) {
         matched = true;
         break;
       }
 
-      // ── Typo-tolerant check: word-level Levenshtein ──
-      const fieldWords = fieldLower.split(/\s+/).filter(w => w.length >= 2);
+      // ── Typo-tolerant check: full query vs full field string ──
+      if (levenshtein(queryLower, fieldLower, maxDistance) <= maxDistance) {
+        matched = true;
+        break;
+      }
+
+      // ── Typo-tolerant check: each query word vs full field string ──
       for (const qw of queryWords) {
-        for (const fw of fieldWords) {
-          if (levenshtein(qw, fw, maxDistance) <= maxDistance) {
-            matched = true;
-            break;
-          }
+        if (levenshtein(qw, fieldLower, maxDistance) <= maxDistance) {
+          matched = true;
+          break;
         }
-        if (matched) break;
       }
       if (matched) break;
     }
@@ -594,19 +596,23 @@ export const executeSearch = createAsyncThunk(
       // ── 8. Contains + fuzzy search on client data ──
       const containsExcludeKeys = new Set(final.map(item => resolveDedupKey(item)));
       const allMappedClient = [...allMappedChats, ...allMappedUsers];
+      const per = performance.now();
       const containsClientResults = runContainsFuzzySearch(
         allMappedClient, queryLower, resolveFields,
         containsExcludeKeys, resolveDedupKey,
       );
+      console.log(`[Search] Contains+fuzzy client search took ${Math.round(performance.now() - per)}ms `);
       if (containsClientResults.length > 0) {
         dispatch(searchSlice.actions.appendResults({ results: containsClientResults }));
-      }
+      } 
 
       // ── 9. Contains + fuzzy search on server data ──
+      const t2 = performance.now();
       const containsServerResults = runContainsFuzzySearch(
         rawServer, queryLower, resolveFields,
         containsExcludeKeys, resolveDedupKey,
       );
+     // console.log(`[Search] Contains+fuzzy server search took ${Math.round(performance.now() - t2)}ms `);
       if (containsServerResults.length > 0) {
         dispatch(searchSlice.actions.appendResults({ results: containsServerResults }));
       }

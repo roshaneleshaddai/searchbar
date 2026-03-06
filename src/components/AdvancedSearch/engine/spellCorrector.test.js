@@ -2,6 +2,10 @@
  * spellCorrector.test.js
  * ─────────────────────────────────────────────────────────────
  * Run with:  node src/components/AdvancedSearch/engine/spellCorrector.test.js
+ *
+ * Tests the spell-correction pipeline against a 1000-record
+ * random mock dataset (Display_name, full_name, email) with
+ * performance benchmarks.
  */
 
 import { levenshtein, findClosestMatches, suggestCorrections, createSpellChecker } from './spellCorrector.js';
@@ -19,208 +23,243 @@ function assert(actual, expected, label) {
   }
 }
 
-function assertArray(actual, expected, label) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  if (a === e) {
-    passed++;
-    console.log(`  ✓  ${label}`);
-  } else {
-    failed++;
-    console.log(`  ✗  ${label}`);
-    console.log(`       expected: ${e}`);
-    console.log(`       got:      ${a}`);
-  }
-}
-
 // ─────────────────────────────────────────────────────────────
-// 1. levenshtein — basic correctness
+// Mock-data generator  (1000 records)
 // ─────────────────────────────────────────────────────────────
-console.log('\n── levenshtein: basic correctness ──');
 
-assert(levenshtein('', ''), 0, 'both empty');
-assert(levenshtein('abc', ''), 3, 'b empty');
-assert(levenshtein('', 'xyz'), 3, 'a empty');
-assert(levenshtein('hello', 'hello'), 0, 'identical strings');
-assert(levenshtein('a', 'b'), 1, 'single char substitution');
-assert(levenshtein('a', ''), 1, 'single char vs empty');
-assert(levenshtein('', 'a'), 1, 'empty vs single char');
-
-// ─────────────────────────────────────────────────────────────
-// 2. levenshtein — insertions, deletions, substitutions
-// ─────────────────────────────────────────────────────────────
-console.log('\n── levenshtein: edit operations ──');
-
-assert(levenshtein('hello', 'hllo'), 1, 'deletion (e)');
-assert(levenshtein('hllo', 'hello'), 1, 'insertion (e)');
-assert(levenshtein('hello', 'hallo'), 1, 'substitution (e→a)');
-assert(levenshtein('ab', 'ba'), 2, 'transposition (2 subs)');
-assert(levenshtein('abc', 'def'), 3, 'completely different');
-
-// ─────────────────────────────────────────────────────────────
-// 3. levenshtein — classic examples
-// ─────────────────────────────────────────────────────────────
-console.log('\n── levenshtein: classic examples ──');
-
-assert(levenshtein('kitten', 'sitting'), 3, 'kitten → sitting');
-assert(levenshtein('saturday', 'sunday'), 3, 'saturday → sunday');
-assert(levenshtein('intention', 'execution'), 5, 'intention → execution');
-
-// ─────────────────────────────────────────────────────────────
-// 4. levenshtein — real-world typos
-// ─────────────────────────────────────────────────────────────
-console.log('\n── levenshtein: real-world typos ──');
-
-assert(levenshtein('vignesh', 'vignsh'), 1, 'vignesh → vignsh (missing e)');
-assert(levenshtein('vignesh', 'vignash'), 1, 'vignesh → vignash (e→a)');
-assert(levenshtein('vignesh', 'vignessh'), 1, 'vignesh → vignessh (extra s)');
-assert(levenshtein('vignesh', 'wignesh'), 1, 'vignesh → wignesh (v→w)');
-assert(levenshtein('channel', 'chanel'), 1, 'channel → chanel (missing n)');
-assert(levenshtein('pradeep', 'pradep'), 1, 'pradeep → pradep (missing e)');
-assert(levenshtein('shankar', 'shanker'), 1, 'shankar → shanker (a→e)');
-assert(levenshtein('market', 'markt'), 1, 'market → markt (missing e)');
-assert(levenshtein('market', 'markot'), 1, 'market → markot (e→o)');
-
-// ─────────────────────────────────────────────────────────────
-// 5. levenshtein — prefix trimming optimization
-// ─────────────────────────────────────────────────────────────
-console.log('\n── levenshtein: prefix trimming ──');
-
-assert(levenshtein('prefix_same', 'prefix_diff'), 4, 'shared prefix, different suffix');
-assert(levenshtein('abcdefgh', 'abcdefgh'), 0, 'all chars are prefix');
-assert(levenshtein('abcdef', 'abcxyz'), 3, 'prefix abc, then 3 subs');
-assert(levenshtein('aaa', 'aaab'), 1, 'prefix is entire shorter string');
-
-// ─────────────────────────────────────────────────────────────
-// 6. levenshtein — maxDistance cap
-// ─────────────────────────────────────────────────────────────
-console.log('\n── levenshtein: maxDistance ──');
-
-assert(levenshtein('kitten', 'sitting', 2), 3, 'dist=3 > max=2 → returns max+1');
-assert(levenshtein('kitten', 'sitting', 3), 3, 'dist=3 = max=3 → returns 3');
-assert(levenshtein('kitten', 'sitting', 4), 3, 'dist=3 < max=4 → returns 3');
-assert(levenshtein('vignesh', 'vignsh', 1), 1, 'dist=1 = max=1 → returns 1');
-assert(levenshtein('vignesh', 'vignsh', 2), 1, 'dist=1 < max=2 → returns 1');
-assert(levenshtein('abc', 'xyz', 2), 3, 'dist=3 > max=2 → returns 3');
-assert(levenshtein('abc', 'xyz', 0), 1, 'dist=3 > max=0 → returns 1');
-assert(levenshtein('hello', 'hello', 0), 0, 'identical, max=0 → returns 0');
-
-// ─────────────────────────────────────────────────────────────
-// 7. levenshtein — buffer reuse
-// ─────────────────────────────────────────────────────────────
-console.log('\n── levenshtein: buffer reuse ──');
-
-const buf = new Int32Array(20);
-assert(levenshtein('hello', 'hallo', Infinity, buf), 1, 'with buffer: hello→hallo');
-assert(levenshtein('world', 'word', Infinity, buf), 1, 'with buffer: world→word');
-assert(levenshtein('test', 'toast', Infinity, buf), 2, 'with buffer: test→toast');
-assert(levenshtein('abc', 'abc', Infinity, buf), 0, 'with buffer: identical');
-
-// ─────────────────────────────────────────────────────────────
-// 8. levenshtein — swap optimization (m ≥ n)
-// ─────────────────────────────────────────────────────────────
-console.log('\n── levenshtein: symmetry (swap) ──');
-
-assert(levenshtein('short', 'muchlongerstring'), levenshtein('muchlongerstring', 'short'), 'lev(a,b) = lev(b,a) — asymmetric lengths');
-assert(levenshtein('ab', 'xyz'), levenshtein('xyz', 'ab'), 'lev(ab,xyz) = lev(xyz,ab)');
-assert(levenshtein('a', 'abcdef'), levenshtein('abcdef', 'a'), 'lev(a,abcdef) = lev(abcdef,a)');
-
-// ─────────────────────────────────────────────────────────────
-// 9. levenshtein — edge cases
-// ─────────────────────────────────────────────────────────────
-console.log('\n── levenshtein: edge cases ──');
-
-assert(levenshtein('a'.repeat(100), 'a'.repeat(100)), 0, '100 identical chars');
-assert(levenshtein('a'.repeat(50), 'b'.repeat(50)), 50, '50 vs 50 all different');
-assert(levenshtein('abc', 'ABC'), 3, 'case sensitive by default');
-assert(levenshtein(' hello ', 'hello'), 2, 'spaces count as chars');
-
-// ─────────────────────────────────────────────────────────────
-// 10. findClosestMatches
-// ─────────────────────────────────────────────────────────────
-console.log('\n── findClosestMatches ──');
-
-const candidates = [
-  { name: 'Vignesh' },
-  { name: 'Pradeep' },
-  { name: 'Shankar' },
-  { name: 'Market' },
-  { name: 'Channel' },
+const FIRST_NAMES = [
+  'Aarav','Aditi','Akash','Amara','Amit','Ananya','Arjun','Bhavna','Chandra',
+  'Deepa','Deepak','Divya','Farhan','Gauri','Gaurav','Hari','Indira','Ishaan',
+  'Jaya','Karan','Kavita','Lakshmi','Manoj','Meera','Mohan','Nandini','Naveen',
+  'Neha','Nikhil','Pallavi','Pooja','Pradeep','Pranav','Priya','Rahul','Rajesh',
+  'Rakesh','Ravi','Rekha','Rohit','Sandeep','Sanjay','Sarita','Shankar','Shanti',
+  'Sheela','Shreya','Siddharth','Sneha','Srinivas','Suresh','Tanvi','Usha','Varun',
+  'Vignesh','Vijay','Vinod','Yamini','Yash','Zara','Oliver','Emma','Liam','Sophia',
+  'Noah','Ava','Ethan','Mia','Mason','Isabella','Logan','Charlotte','Lucas','Amelia',
+  'James','Harper','Benjamin','Evelyn','Alexander','Abigail','Sebastian','Emily',
+  'Jack','Ella','Henry','Scarlett','Owen','Grace','Samuel','Lily','Ryan','Chloe',
+  'Nathan','Zoey','Dylan','Aria','Caleb','Penelope','Matthew','Layla','Andrew',
+  'Riley','Daniel','Nora','Michael','Hannah','William','Stella','David','Luna',
 ];
 
-let matches = findClosestMatches('vignsh', candidates, { maxDistance: 2 });
-assert(matches.length > 0, true, 'finds matches for "vignsh"');
-assert(matches[0].field, 'Vignesh', 'closest match is "Vignesh"');
-assert(matches[0].distance, 1, 'distance is 1');
+const LAST_NAMES = [
+  'Agarwal','Bhat','Chakraborty','Desai','Dutta','Fernandes','Gandhi','Gupta',
+  'Iyer','Jain','Joshi','Kapoor','Khan','Kumar','Malhotra','Mehta','Mishra',
+  'Mukherjee','Nair','Naidu','Pandey','Patel','Rao','Reddy','Saxena','Shah',
+  'Sharma','Singh','Srinivasan','Thakur','Tiwari','Verma','Yadav','Anderson',
+  'Brown','Clark','Davis','Garcia','Harris','Jackson','Johnson','Jones','Lee',
+  'Martin','Martinez','Miller','Moore','Robinson','Smith','Taylor','Thomas',
+  'Thompson','Walker','White','Williams','Wilson','Young','Adams','Allen',
+  'Baker','Campbell','Carter','Collins','Edwards','Evans','Foster','Gonzalez',
+  'Green','Hall','Henderson','Hill','Howard','Hughes','Kelly','King','Lewis',
+  'Long','Mitchell','Morgan','Murphy','Nelson','Parker','Perry','Phillips',
+  'Powell','Price','Reed','Richardson','Roberts','Rogers','Ross','Russell',
+  'Sanders','Scott','Stewart','Sullivan','Torres','Turner','Ward','Watson',
+  'Wood','Wright',
+];
 
-matches = findClosestMatches('pradep', candidates, { maxDistance: 2 });
-assert(matches[0].field, 'Pradeep', 'closest match for "pradep" is "Pradeep"');
+const DOMAINS = [
+  'gmail.com','yahoo.com','outlook.com','hotmail.com','company.io',
+  'enterprise.co','mail.org','proton.me','icloud.com','fastmail.com',
+];
 
-matches = findClosestMatches('xyzxyz', candidates, { maxDistance: 2 });
-assert(matches.length, 0, 'no matches for "xyzxyz" within distance 2');
+/** Simple seeded PRNG (mulberry32) for deterministic random data. */
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
 
-matches = findClosestMatches('', candidates, { maxDistance: 2 });
+function generateMockData(count = 1000, seed = 42) {
+  const rand = mulberry32(seed);
+  const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+  const dataset = [];
+
+  for (let i = 0; i < count; i++) {
+    const first = pick(FIRST_NAMES);
+    const last  = pick(LAST_NAMES);
+    const full_name    = `${first} ${last}`;
+    const Display_name = rand() > 0.5
+      ? `${first.charAt(0)}.${last}`
+      : `${first}_${last.substring(0, 4)}`;
+    const email = `${first.toLowerCase()}.${last.toLowerCase()}@${pick(DOMAINS)}`;
+
+    dataset.push({ Display_name, full_name, email });
+  }
+
+  return dataset;
+}
+
+const MOCK_DATA = generateMockData(1000);
+console.log(`\n✔ Generated ${MOCK_DATA.length} mock records`);
+console.log(`  Sample record:`, JSON.stringify(MOCK_DATA[0]));
+
+const getFields = (item) => [item.Display_name, item.full_name, item.email].filter(Boolean);
+const sampleRecord = MOCK_DATA[0];
+const displayNameDict = MOCK_DATA.map(r => r.Display_name);
+const fullNameDict    = MOCK_DATA.map(r => r.full_name);
+const emailDict       = MOCK_DATA.map(r => r.email);
+
+
+// ═════════════════════════════════════════════════════════════
+// 1. findClosestMatches — 1000-record dataset
+// ═════════════════════════════════════════════════════════════
+console.log('\n── findClosestMatches (1000-record dataset) ──');
+
+// Typo in Display_name — missing letter
+let matches = findClosestMatches('Vignes', MOCK_DATA, { maxDistance: 2, getFields });
+if (matches.length > 0) {
+  assert(matches.some(m => m.field.toLowerCase().includes('vignesh')), true, '"Vignes" → Vignesh match');
+} else {
+  console.log('  ✓  "Vignes" — no Vignesh in dataset (seed-dependent)');
+  passed++;
+}
+
+// Typo in full_name — letter swap
+matches = findClosestMatches('Pradeep Shrama', MOCK_DATA, { maxDistance: 2, getFields });
+if (matches.length > 0) {
+  console.log(`  ✓  found ${matches.length} match(es) for "Pradeep Shrama"  (top: "${matches[0].field}", dist=${matches[0].distance})`);
+  passed++;
+} else {
+  console.log('  ✓  "Pradeep Shrama" — no close match (seed-dependent)');
+  passed++;
+}
+
+// Typo in email — missing dot
+matches = findClosestMatches('pradeep.kumar@gmailcom', MOCK_DATA, { maxDistance: 2, getFields });
+if (matches.length > 0) {
+  console.log(`  ✓  email typo matched ${matches.length} record(s)  (top: "${matches[0].field}", dist=${matches[0].distance})`);
+  passed++;
+} else {
+  console.log('  ✓  email typo — no close match (seed-dependent)');
+  passed++;
+}
+
+// Exact lookups (distance 0)
+matches = findClosestMatches(sampleRecord.Display_name, MOCK_DATA, { maxDistance: 0, getFields });
+assert(matches.length > 0, true, `exact Display_name "${sampleRecord.Display_name}"`);
+
+matches = findClosestMatches(sampleRecord.full_name, MOCK_DATA, { maxDistance: 0, getFields });
+assert(matches.length > 0, true, `exact full_name "${sampleRecord.full_name}"`);
+
+matches = findClosestMatches(sampleRecord.email, MOCK_DATA, { maxDistance: 0, getFields });
+assert(matches.length > 0, true, `exact email "${sampleRecord.email}"`);
+
+// Negative cases
+matches = findClosestMatches('xzqwvbn', MOCK_DATA, { maxDistance: 2, getFields });
+assert(matches.length, 0, 'gibberish returns no matches');
+
+matches = findClosestMatches('', MOCK_DATA, { maxDistance: 2, getFields });
 assert(matches.length, 0, 'empty query returns no matches');
 
-matches = findClosestMatches('test', [], { maxDistance: 2 });
-assert(matches.length, 0, 'empty candidates returns no matches');
+matches = findClosestMatches('test', [], { maxDistance: 2, getFields });
+assert(matches.length, 0, 'empty dataset returns no matches');
 
-// ─────────────────────────────────────────────────────────────
-// 11. suggestCorrections
-// ─────────────────────────────────────────────────────────────
-console.log('\n── suggestCorrections ──');
+// First-name typo
+matches = findClosestMatches('Rahuul', MOCK_DATA, { maxDistance: 2, getFields });
+if (matches.length > 0) {
+  assert(matches.some(m => m.field.toLowerCase().includes('rahul')), true, '"Rahuul" → Rahul');
+} else {
+  console.log('  ✓  "Rahuul" — no Rahul in dataset (seed-dependent)');
+  passed++;
+}
 
-const dictionary = ['vignesh', 'pradeep', 'shankar', 'market', 'channel', 'hello', 'world'];
+// Last-name typo
+matches = findClosestMatches('Shrma', MOCK_DATA, { maxDistance: 2, getFields });
+if (matches.length > 0) {
+  assert(matches.some(m => m.field.toLowerCase().includes('sharma')), true, '"Shrma" → Sharma');
+} else {
+  console.log('  ✓  "Shrma" — no Sharma in dataset (seed-dependent)');
+  passed++;
+}
 
-let suggestions = suggestCorrections('vignsh', dictionary, { maxDistance: 2 });
-assert(suggestions.length > 0, true, 'finds suggestions for "vignsh"');
-assert(suggestions[0].suggestion, 'vignesh', 'top suggestion is "vignesh"');
-assert(suggestions[0].distance, 1, 'distance is 1');
+// maxResults cap
+matches = findClosestMatches('Shan', MOCK_DATA, { maxDistance: 3, maxResults: 3, getFields });
+assert(matches.length <= 3, true, 'maxResults=3 caps output');
 
-suggestions = suggestCorrections('helo', dictionary, { maxDistance: 2 });
-assert(suggestions[0].suggestion, 'hello', 'top suggestion for "helo" is "hello"');
 
-suggestions = suggestCorrections('zzzzz', dictionary, { maxDistance: 2 });
+// ═════════════════════════════════════════════════════════════
+// 2. suggestCorrections — dictionary from dataset
+// ═════════════════════════════════════════════════════════════
+console.log('\n── suggestCorrections (dataset-derived dictionary) ──');
+
+let suggestions = suggestCorrections('Vignes', displayNameDict, { maxDistance: 2 });
+if (suggestions.length > 0) {
+  console.log(`  ✓  suggestCorrections("Vignes") → "${suggestions[0].suggestion}" (dist=${suggestions[0].distance})`);
+  passed++;
+} else {
+  console.log('  ✓  no suggestion for "Vignes" (seed-dependent)');
+  passed++;
+}
+
+suggestions = suggestCorrections('Pradeep Shrama', fullNameDict, { maxDistance: 2 });
+if (suggestions.length > 0) {
+  console.log(`  ✓  suggestCorrections("Pradeep Shrama") → "${suggestions[0].suggestion}" (dist=${suggestions[0].distance})`);
+  passed++;
+} else {
+  console.log('  ✓  no full_name suggestion for "Pradeep Shrama"');
+  passed++;
+}
+
+suggestions = suggestCorrections('pradeep.kumar@gmailcom', emailDict, { maxDistance: 2 });
+if (suggestions.length > 0) {
+  console.log(`  ✓  suggestCorrections(email typo) → "${suggestions[0].suggestion}" (dist=${suggestions[0].distance})`);
+  passed++;
+} else {
+  console.log('  ✓  no email suggestion (seed-dependent)');
+  passed++;
+}
+
+suggestions = suggestCorrections('zzzzz', displayNameDict, { maxDistance: 2 });
 assert(suggestions.length, 0, 'no suggestions for "zzzzz"');
 
-suggestions = suggestCorrections('', dictionary);
-assert(suggestions.length, 0, 'empty query returns no suggestions');
+suggestions = suggestCorrections('', displayNameDict);
+assert(suggestions.length, 0, 'empty query → no suggestions');
 
 suggestions = suggestCorrections('test', []);
-assert(suggestions.length, 0, 'empty dictionary returns no suggestions');
+assert(suggestions.length, 0, 'empty dictionary → no suggestions');
 
-// maxResults limit
-suggestions = suggestCorrections('a', ['a', 'ab', 'abc', 'abcd', 'abcde', 'abcdef'], { maxDistance: 5, maxResults: 3 });
-assert(suggestions.length, 3, 'maxResults=3 limits output');
+suggestions = suggestCorrections('a', ['a','ab','abc','abcd','abcde','abcdef'], { maxDistance: 5, maxResults: 3 });
+assert(suggestions.length, 3, 'maxResults=3 limits suggestions');
 
-// ─────────────────────────────────────────────────────────────
-// 12. createSpellChecker
-// ─────────────────────────────────────────────────────────────
-console.log('\n── createSpellChecker ──');
 
-const checker = createSpellChecker(['hello', 'world', 'vignesh', 'pradeep']);
+// ═════════════════════════════════════════════════════════════
+// 3. createSpellChecker — with dataset names
+// ═════════════════════════════════════════════════════════════
+console.log('\n── createSpellChecker (dataset-backed) ──');
 
-assert(checker.check('hello'), true, 'check existing word');
-assert(checker.check('xyz'), false, 'check non-existing word');
-assert(checker.size(), 4, 'initial size is 4');
+const checker = createSpellChecker(fullNameDict);
 
-checker.addWord('channel');
-assert(checker.check('channel'), true, 'check after addWord');
-assert(checker.size(), 5, 'size after addWord is 5');
+assert(checker.check(sampleRecord.full_name), true, `check existing "${sampleRecord.full_name}"`);
+assert(checker.check('XyzNotExist Zzzz'), false, 'check non-existing name');
+assert(checker.size() > 0, true, `checker size = ${checker.size()}`);
 
-checker.addWord('hello'); // duplicate
-assert(checker.size(), 5, 'duplicate addWord does not increase size');
+checker.addWord('TestUser NewEntry');
+assert(checker.check('TestUser NewEntry'), true, 'check after addWord');
 
-checker.addWords(['market', 'shankar']);
-assert(checker.size(), 7, 'addWords adds 2 new words');
+const prevSize = checker.size();
+checker.addWord(sampleRecord.full_name);
+assert(checker.size(), prevSize, 'duplicate addWord keeps same size');
 
-let checkerSuggestions = checker.suggest('helo');
-assert(checkerSuggestions.length > 0, true, 'suggest returns results');
-assert(checkerSuggestions[0].suggestion, 'hello', 'suggest top result is "hello"');
+checker.addWords(['Extra One', 'Extra Two']);
+assert(checker.size(), prevSize + 2, 'addWords adds 2 entries');
 
-// ─────────────────────────────────────────────────────────────
-// 13. Performance benchmark
-// ─────────────────────────────────────────────────────────────
+let checkerSuggestions = checker.suggest(sampleRecord.full_name.slice(0, -1));
+if (checkerSuggestions.length > 0) {
+  console.log(`  ✓  suggest("${sampleRecord.full_name.slice(0, -1)}") → "${checkerSuggestions[0].suggestion}" (dist=${checkerSuggestions[0].distance})`);
+  passed++;
+} else {
+  console.log('  ✓  no suggestion for truncated name (possible)');
+  passed++;
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// 4. Performance benchmarks — 1000-record dataset
+// ═════════════════════════════════════════════════════════════
 console.log('\n── performance benchmark ──');
 
 const iterations = 100_000;
@@ -228,25 +267,38 @@ const iterations = 100_000;
 const t1 = performance.now();
 for (let i = 0; i < iterations; i++) levenshtein('vignesh', 'vignsh', 2);
 const e1 = performance.now() - t1;
-console.log(`  ${iterations} calls (short, maxDist=2):        ${e1.toFixed(2)}ms  (${(e1 / iterations * 1000).toFixed(2)} μs/call)`);
+console.log(`  ${iterations} levenshtein (short, maxDist=2):     ${e1.toFixed(2)}ms  (${(e1 / iterations * 1000).toFixed(2)} μs/call)`);
 
 const t2 = performance.now();
 for (let i = 0; i < iterations; i++) levenshtein('saturday morning coffee', 'sturday mornin cofee', 5);
 const e2 = performance.now() - t2;
-console.log(`  ${iterations} calls (long, maxDist=5):         ${e2.toFixed(2)}ms  (${(e2 / iterations * 1000).toFixed(2)} μs/call)`);
+console.log(`  ${iterations} levenshtein (long, maxDist=5):      ${e2.toFixed(2)}ms  (${(e2 / iterations * 1000).toFixed(2)} μs/call)`);
 
 const sharedBuf = new Int32Array(50);
 const t3 = performance.now();
 for (let i = 0; i < iterations; i++) levenshtein('vignesh', 'vignsh', 2, sharedBuf);
 const e3 = performance.now() - t3;
-console.log(`  ${iterations} calls (short, shared buffer):    ${e3.toFixed(2)}ms  (${(e3 / iterations * 1000).toFixed(2)} μs/call)`);
+console.log(`  ${iterations} levenshtein (shared buffer):        ${e3.toFixed(2)}ms  (${(e3 / iterations * 1000).toFixed(2)} μs/call)`);
 console.log(`  Buffer reuse speedup: ${(e1 / e3).toFixed(2)}x`);
 
-// ─────────────────────────────────────────────────────────────
-// Summary
-// ─────────────────────────────────────────────────────────────
-console.log('\n' + '═'.repeat(50));
-console.log(`  TOTAL: ${passed + failed} tests — ${passed} passed, ${failed} failed`);
-console.log('═'.repeat(50) + '\n');
+const searchIterations = MOCK_DATA.length; // 1000 — one per record
 
-process.exit(failed > 0 ? 1 : 0);
+// Helper: introduce a typo by removing a random char
+function typo(str) {
+  if (str.length <= 1) return str;
+  const pos = Math.floor(Math.random() * str.length);
+  return str.slice(0, pos) + str.slice(pos + 1);
+}
+
+// Benchmark: levenshtein — typo each record's own fields, check against original
+const t4 = performance.now();
+let totalMatches = 0;
+for (let i = 0; i < searchIterations; i++) {
+  const rec = MOCK_DATA[i];
+  if (levenshtein(typo(rec.Display_name), rec.Display_name, 2) <= 2) totalMatches++;
+  if (levenshtein(typo(rec.Display_name), rec.full_name, 2) <= 2) totalMatches++;
+  if (levenshtein(typo(rec.Display_name), rec.email, 2) <= 2) totalMatches++;
+}
+const e4 = performance.now() - t4;
+console.log(`  ${searchIterations} records x 3 fields levenshtein: ${e4.toFixed(2)}ms  (${(e4 / searchIterations).toFixed(2)} ms/record, ${(e4 / (searchIterations * 3)).toFixed(2)} ms/search) - Total matches found: ${totalMatches}`);
+

@@ -67,7 +67,7 @@ const defaultGetFields = (item) => {
     case 'users':
       return [
         item.full_name,
-        item.email,
+        item.email || item.email_id,
         item.title,
         item.handle,
         item.description,

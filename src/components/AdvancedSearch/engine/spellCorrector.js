@@ -163,7 +163,7 @@ export function levenshtein(a, b, maxDistance = Infinity, buffer = null) {
  */
 export function findClosestMatches(query, candidates, options = {}) {
   const {
-    getFields = (item) => [item.name || item.title || item.label || String(item)].filter(Boolean),
+    getFields = (item) => [item.full_name || item.Display_name || item.email ||item.name||item.title || String(item)].filter(Boolean),
     maxDistance = 2,
     maxResults = 5,
     caseSensitive = false,

@@ -228,10 +228,10 @@ function CategoryList({ as: Tag = 'div', children, ...props }) {
  * @param {string|Component} [props.as='div']
  * @param {number} [props.limit]   - Max results to show
  * @param {Function} props.children
- *   (item: object, index: number, isHighlighted: boolean, itemProps: object) => ReactNode
+ *   (item: object, index: number, isHighlighted: boolean, itemProps: object, query: string) => ReactNode
  */
 function ResultList({ as: Tag = 'div', limit, children, ...props }) {
-  const { filteredResults, highlightedIndex, getResultProps } = useSearchContext();
+  const { filteredResults, highlightedIndex, getResultProps, query } = useSearchContext();
   const items = limit ? filteredResults.slice(0, limit) : filteredResults;
   // console.log('Rendering ResultList with items:', items);
   if (!items.length) return null;
@@ -244,6 +244,7 @@ function ResultList({ as: Tag = 'div', limit, children, ...props }) {
           idx,
           idx === highlightedIndex,
           getResultProps(item, idx),
+          query,
         )
       )}
     </Tag>

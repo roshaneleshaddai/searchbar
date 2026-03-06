@@ -4,8 +4,8 @@ import { mockData } from './mock/clientmockData'
 
 const index = ({ loggedUser }) => {
   const clientData = {
-    chats: mockData.chats || [], 
-    users: mockData.users || [], 
+    chats: Object.values(mockData.chats || {}), 
+    users: Object.values(mockData.users || {}), 
   };
   
   // We pass just the names of modules we want enabled
